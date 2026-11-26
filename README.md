@@ -5,6 +5,11 @@ Rewrite Terminal Kommand for BB. A port of
 rewrites shell commands through the `rtk` CLI proxy for 60–90% token savings
 on verbose output (builds, tests, git diffs, package-manager output).
 
+The rewrite policy is upstream's, at v1.2.3 (commit `da69176`): `rtk rewrite`
+exit 0 or 3 with a printed command different from the original is a rewrite;
+1 (no equivalent), 2 (denied rewrite), an unknown code, a timeout or a missing
+binary all run the original command unchanged.
+
 ## Tools
 
 - **`rtk_shell`** — runs a shell command through RTK for filtered output.
@@ -46,8 +51,11 @@ bb plugin config rtk
 bb plugin config rtk set rtkPath /usr/local/bin/rtk
 ```
 
-## Build
+## Development
 
 ```sh
-bb plugin build
+npm install
+npm run build      # tsc typecheck (noEmit)
+npm test           # rewrite-policy tests (runs live rtk when installed)
+npm run bundle     # bb plugin build → dist/
 ```

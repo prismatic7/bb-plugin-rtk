@@ -13,11 +13,47 @@
 //   rtk_shell "git status" → rewrites → runs through rtk → returns filtered output
 import { type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { exec as execCb } from "child_process";
+import { exec as execCb, execFile as execFileCb } from "child_process";
 import { promisify } from "util";
 import { existsSync } from "fs";
 
 const execAsync = promisify(execCb);
+const execFileAsync = promisify(execFileCb);
+
+// ─── Rewrite policy (ported from ogallotti/rtk-hermes) ───────────────
+//
+// `rtk rewrite` exit codes: 0 = rewrite allowed, 1 = no equivalent,
+// 2 = deny, 3 = ask/confirm. Codes 0 and 3 both put a valid rewritten
+// command on stdout. Anything else — and a timeout or a missing binary —
+// is fail-open: the original command runs unchanged.
+
+export interface RewriteDecision {
+  command: string;
+  rewrote: boolean;
+  note?: string;
+}
+
+export function decideRewrite(
+  exitCode: number | null,
+  stdout: string,
+  original: string,
+): RewriteDecision {
+  const candidate = (stdout ?? "").trim();
+  if ((exitCode === 0 || exitCode === 3) && candidate && candidate !== original.trim()) {
+    return { command: candidate, rewrote: true };
+  }
+  const notes: Record<number, string> = {
+    0: "RTK left the command unchanged",
+    1: "no RTK equivalent",
+    2: "rewrite denied by RTK",
+    3: "RTK left the command unchanged",
+  };
+  const note =
+    exitCode === null
+      ? "RTK rewrite failed or timed out"
+      : (notes[exitCode] ?? `unexpected rewrite exit ${exitCode}`);
+  return { command: original, rewrote: false, note };
+}
 
 // ─── Settings ────────────────────────────────────────────────────────
 
@@ -106,19 +142,34 @@ export default async function plugin(bb: BbPluginApi) {
         const cwd = (await resolveProjectDir(projectId)) ?? undefined;
         bb.log.info(`[rtk] thread ${threadId}${cwd ? ` (cwd: ${cwd})` : ""}: ${command}`);
 
-        // Step 1: rewrite — get the optimized command string
-        const { stdout: rewritten } = await execAsync(`${rtk} rewrite ${shellEscape(command)}`, {
-          cwd,
-          timeout: 10_000,
-          maxBuffer: 64 * 1024,
-        });
+        // Step 1: rewrite — get the optimized command string. execFile rather
+        // than a shell, so the command needs no escaping. A non-zero exit is
+        // expected here (1 = no equivalent, 2 = deny), not an error.
+        let rewriteCode: number | null = null;
+        let rewriteStdout = "";
+        try {
+          const r = await execFileAsync(rtk, ["rewrite", command], {
+            cwd,
+            timeout: 5_000,
+            maxBuffer: 64 * 1024,
+          });
+          rewriteCode = 0;
+          rewriteStdout = r.stdout;
+        } catch (err: any) {
+          rewriteCode = typeof err.code === "number" ? err.code : null;
+          rewriteStdout = err.stdout ?? "";
+        }
 
-        const rtkCmd = rewritten.trim();
-        bb.log.info(`[rtk] thread ${threadId}: rewrote → ${rtkCmd}`);
+        const decision = decideRewrite(rewriteCode, rewriteStdout, command);
+        if (decision.rewrote) {
+          bb.log.info(`[rtk] thread ${threadId}: rewrote → ${decision.command}`);
+        } else {
+          bb.log.info(`[rtk] thread ${threadId}: running unchanged (${decision.note})`);
+        }
 
-        // Step 2: execute the rewritten command through RTK as a shell command
-        // `rtk rewrite` returns e.g. "rtk git diff" — run that verbatim
-        const { stdout, stderr } = await execAsync(rtkCmd, {
+        // Step 2: execute the chosen command as a shell command.
+        // `rtk rewrite` returns e.g. "rtk git diff" — run that verbatim.
+        const { stdout, stderr } = await execAsync(decision.command, {
           cwd,
           timeout: 300_000,
           maxBuffer: 2 * 1024 * 1024,
@@ -144,11 +195,4 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(() => {
     bb.log.info("bb-plugin-rtk disposed");
   });
-}
-
-// ─── Minimal shell-escaping for the rewrite pass ─────────────────────
-
-function shellEscape(s: string): string {
-  // Single-quote the argument, escaping embedded single quotes
-  return `'${s.replace(/'/g, "'\\''")}'`;
 }
