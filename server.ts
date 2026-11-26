@@ -100,19 +100,6 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  // Resolve the project directory for a tool call so commands run in the
-  // project's working directory, not the bb server process cwd.
-  async function resolveProjectDir(projectId: string): Promise<string | null> {
-    try {
-      const project = await bb.sdk.projects.get({ projectId });
-      const source = project?.sources?.find((s: any) => s.type === "local_path");
-      if (source?.path) return source.path;
-    } catch {
-      // fall through
-    }
-    return null;
-  }
-
   // ── Agent tool: rtk_shell ─────────────────────────────────────────
 
   bb.agents.registerTool({
@@ -139,7 +126,7 @@ export default async function plugin(bb: BbPluginApi) {
         if (!resolved.ok) return `rtk_shell: ${resolved.message}`;
         const rtk = resolved.path;
 
-        const cwd = (await resolveProjectDir(projectId)) ?? undefined;
+        const cwd = await threadCwd(bb, threadId, projectId);
         bb.log.info(`[rtk] thread ${threadId}${cwd ? ` (cwd: ${cwd})` : ""}: ${command}`);
 
         // Step 1: rewrite — get the optimized command string. execFile rather
@@ -195,4 +182,33 @@ export default async function plugin(bb: BbPluginApi) {
   bb.onDispose(() => {
     bb.log.info("bb-plugin-rtk disposed");
   });
+}
+/** The directory this thread actually works in: its environment's path, not
+ *  the project root. A worktree or an attached workspace is a different
+ *  directory from the project, and resolving paths against the project puts
+ *  files in the wrong tree. */
+export async function threadCwd(bb: BbPluginApi, threadId: string, projectId: string): Promise<string> {
+  const asPath = (v: any): string | null =>
+    v && typeof v === "object" && typeof v.path === "string" && v.path.trim() ? v.path : null;
+  try {
+    const t: any = await bb.sdk.threads.get({ threadId } as any);
+    const thread = t?.thread ?? t;
+    const envId = thread?.environmentId;
+    if (envId) {
+      const e: any = await bb.sdk.environments.get({ environmentId: envId } as any);
+      const p = asPath(e?.environment ?? e);
+      if (p) return p;
+    }
+  } catch {
+    // fall through to the project
+  }
+  try {
+    const p: any = await bb.sdk.projects.get({ projectId } as any);
+    const sources = (p?.project ?? p)?.sources ?? [];
+    const src = Array.isArray(sources) ? sources.find((s: any) => s.type === "local_path") : null;
+    if (src?.path) return src.path;
+  } catch {
+    // fall through to the server cwd
+  }
+  return process.cwd();
 }
